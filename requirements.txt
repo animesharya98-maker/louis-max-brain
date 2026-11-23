@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+websockets
+groq
+edge-tts
+yt-dlp
+duckduckgo-search
+python-multipart
