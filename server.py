@@ -1,143 +1,145 @@
 import os
-import io
 import json
 import asyncio
+import tempfile
 import subprocess
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from groq import Groq
+from groq import AsyncGroq
 import edge_tts
 from duckduckgo_search import DDGS
 import yt_dlp
 
 app = FastAPI()
+client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Apni free Groq API key yahan ya Render Environment Variables mein daal
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "APNI_GROQ_API_KEY_YAHAN_DAAL")
-client = Groq(api_key=GROQ_API_KEY)
-
-SYSTEM_PROMPT = """
-Tu 'Louis Max' hai — Abhinandan (Arjun) ka personal AI voice assistant.
-Tu smart, friendly, thoda witty, aur Hindi/Hinglish/English mein natural baat karta hai.
-Rules:
-1. Jawab hamesha chhota aur crisp rakh (2-3 lines max) taaki bolne mein fast lage.
-2. Agar user koi gaana bajane ko bole (e.g., "Play Softly", "Karan Aujla ka gaana baja"), toh sirf JSON format mein reply kar:
-   {"action": "play_music", "query": "<exact song and artist name>"}
-3. Agar user live info, news, score, weather, ya current fact pooche, toh pehle search context ka use kar.
-"""
+@app.get("/")
+async def root():
+    return {"status": "Louis Max Brain Online", "ws_endpoint": "/ws"}
 
 def search_web(query: str) -> str:
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=3))
-            return "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+            if not results:
+                return "No search results found."
+            return "\n".join([f"{r['title']}: {r['body']}" for r in results])
     except Exception as e:
-        return f"Search error: {e}"
+        return f"Search error: {str(e)}"
 
-def get_youtube_audio_url(song_query: str):
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'noplaylist': True,
-        'default_search': 'ytsearch1'
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(song_query, download=False)
-        if 'entries' in info:
-            info = info['entries'][0]
-        return info['url'], info.get('title', song_query)
+def get_song_pcm(song_query: str) -> bytes:
+    try:
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "default_search": "ytsearch1",
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(song_query, download=False)
+            if "entries" in info:
+                info = info["entries"][0]
+            audio_url = info["url"]
 
-async def stream_pcm_to_esp32(websocket: WebSocket, audio_source: str):
-    """Kisi bhi audio file ya YouTube URL ko 16kHz 16-bit Mono PCM mein convert karke ESP32 ko bhejta hai"""
+        cmd = [
+            "ffmpeg", "-i", audio_url,
+            "-t", "30",
+            "-f", "s16le", "-acodec", "pcm_s16le",
+            "-ar", "16000", "-ac", "1", "pipe:1"
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return proc.stdout
+    except Exception as e:
+        print("Music error:", e)
+        return b""
+
+async def text_to_pcm(text: str) -> bytes:
+    communicate = edge_tts.Communicate(text, "en-IN-PrabhatNeural")
+    mp3_bytes = b""
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            mp3_bytes += chunk["data"]
+
     cmd = [
-        "ffmpeg", "-i", audio_source,
+        "ffmpeg", "-i", "pipe:0",
         "-f", "s16le", "-acodec", "pcm_s16le",
         "-ar", "16000", "-ac", "1", "pipe:1"
     ]
-    process = await asyncio.create_subprocess_exec(
-        *cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-    )
-    try:
-        while True:
-            chunk = await process.stdout.read(2048)
-            if not chunk:
-                break
-            await websocket.send_bytes(chunk)
-            await asyncio.sleep(0.05) # Buffer overflow rokne ke liye pacing
-    finally:
-        if process.returncode is None:
-            process.kill()
-
-async def text_to_speech_stream(websocket: WebSocket, text: str):
-    communicate = edge_tts.Communicate(text, "hi-IN-MadhurNeural") # Natural Indian Male Voice
-    temp_mp3 = "/tmp/reply.mp3"
-    await communicate.save(temp_mp3)
-    await stream_pcm_to_esp32(websocket, temp_mp3)
+    proc = subprocess.run(cmd, input=mp3_bytes, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return proc.stdout
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    print("Louis Max ESP32 Connected!")
-    chat_history = [{"role": "system", "content": SYSTEM_PROMPT}]
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    print("ESP32 Louis Max Connected!")
+    await ws.send_text(json.dumps({"status": "Online! Listening..."}))
 
     try:
         while True:
-            # ESP32 se WAV audio bytes receive kar
-            audio_bytes = await websocket.receive_bytes()
-            if len(audio_bytes) < 3200:
-                continue
+            wav_bytes = await ws.receive_bytes()
+            await ws.send_text(json.dumps({"status": "Thinking..."}))
 
-            await websocket.send_text(json.dumps({"status": "Thinking..."}))
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp.write(wav_bytes)
+                tmp_path = tmp.name
 
-            # 1. Speech-to-Text (Groq Whisper)
-            audio_file = io.BytesIO(audio_bytes)
-            audio_file.name = "speech.wav"
-            transcription = client.audio.transcriptions.create(
-                file=audio_file,
-                model="whisper-large-v3-turbo"
-            )
-            user_text = transcription.text.strip()
-            print(f"User: {user_text}")
+            with open(tmp_path, "rb") as audio_file:
+                transcript = await client.audio.transcriptions.create(
+                    model="whisper-large-v3-turbo",
+                    file=audio_file
+                )
+            os.remove(tmp_path)
+            user_text = transcript.text.strip()
+            print("User said:", user_text)
+
             if not user_text:
+                await ws.send_text(json.dumps({"status": "Online! Listening..."}))
                 continue
 
-            # 2. Check if web search is needed
-            search_triggers = ["news", "score", "weather", "kaun hai", "kya hai", "latest", "price", "aaj", "search"]
-            context_note = ""
-            if any(word in user_text.lower() for word in search_triggers):
-                await websocket.send_text(json.dumps({"status": "Searching..."}))
-                web_data = search_web(user_text)
-                context_note = f"\n[Live Web Search Results:\n{web_data}]"
+            lower_text = user_text.lower()
+            if "volume" in lower_text:
+                vol = 1.0 if ("full" in lower_text or "max" in lower_text or "100" in lower_text) else (0.3 if "low" in lower_text else 0.7)
+                await ws.send_text(json.dumps({"volume": vol}))
+                pcm = await text_to_pcm(f"Volume set to {int(vol * 100)} percent.")
+                await ws.send_bytes(pcm)
+                await ws.send_text(json.dumps({"status": "Online! Listening..."}))
+                continue
 
-            chat_history.append({"role": "user", "content": user_text + context_note})
+            if any(k in lower_text for k in ["play ", "song", "gaana", "music"]):
+                await ws.send_text(json.dumps({"status": "Loading Song..."}))
+                pcm_song = await asyncio.to_thread(get_song_pcm, user_text)
+                if pcm_song:
+                    await ws.send_text(json.dumps({"status": "Playing Music..."}))
+                    for i in range(0, len(pcm_song), 4096):
+                        await ws.send_bytes(pcm_song[i:i+4096])
+                        await asyncio.sleep(0.08)
+                else:
+                    pcm = await text_to_pcm("Sorry, I could not load that song right now.")
+                    await ws.send_bytes(pcm)
+                await ws.send_text(json.dumps({"status": "Online! Listening..."}))
+                continue
 
-            # 3. LLM Response (Groq Llama 3.3 70B)
-            completion = client.chat.completions.create(
+            context = ""
+            if any(k in lower_text for k in ["search", "news", "weather", "latest", "who is", "what is", "score", "price", "today", "aaj", "kya hai"]):
+                await ws.send_text(json.dumps({"status": "Searching Web..."}))
+                context = await asyncio.to_thread(search_web, user_text)
+
+            completion = await client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=chat_history[-8:],
-                temperature=0.7,
-                max_tokens=200
+                messages=[
+                    {"role": "system", "content": "You are Louis Max, a helpful voice AI assistant on an ESP32 device. Keep answers concise (2 short sentences) for spoken voice output."},
+                    {"role": "user", "content": f"User query: {user_text}\nWeb context: {context}"}
+                ]
             )
-            reply = completion.choices[0].message.content.strip()
-            chat_history.append({"role": "assistant", "content": reply})
-            print(f"Louis Max: {reply}")
+            reply_text = completion.choices[0].message.content
+            print("Louis Max:", reply_text)
 
-            # 4. Check if Music Action triggered
-            if '"action": "play_music"' in reply:
-                try:
-                    data = json.loads(reply[reply.find("{"):reply.rfind("}")+1])
-                    song_query = data["query"]
-                    await websocket.send_text(json.dumps({"status": f"Playing: {song_query[:18]}"}))
-                    await text_to_speech_stream(websocket, f"Chala raha hoon {song_query}")
-                    stream_url, title = get_youtube_audio_url(song_query)
-                    await websocket.send_text(json.dumps({"status": f"♪ {title[:18]}"}))
-                    await stream_pcm_to_esp32(websocket, stream_url)
-                except Exception as e:
-                    await text_to_speech_stream(websocket, "Sorry bhai, ye gaana load nahi ho paya.")
-            else:
-                await websocket.send_text(json.dumps({"status": "Speaking..."}))
-                await text_to_speech_stream(websocket, reply)
+            await ws.send_text(json.dumps({"status": "Speaking..."}))
+            pcm_reply = await text_to_pcm(reply_text)
+            for i in range(0, len(pcm_reply), 4096):
+                await ws.send_bytes(pcm_reply[i:i+4096])
+                await asyncio.sleep(0.08)
 
-            await websocket.send_text(json.dumps({"status": "Listening..."}))
+            await ws.send_text(json.dumps({"status": "Online! Listening..."}))
 
     except WebSocketDisconnect:
-        print("ESP32 Disconnected")
+        print("ESP32 disconnected")
